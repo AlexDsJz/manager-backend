@@ -98,12 +98,34 @@ docker-compose exec backend python manage.py createsuperuser
 
 ### Run without Docker
 
+> Requires Python 3.12 and a running PostgreSQL instance.
+
+**Create and activate the virtual environment:**
+
 ```bash
-python -m venv venv && source venv/bin/activate
+# Windows
+python -m venv venv
+venv\Scripts\activate
+
+# macOS / Linux
+python -m venv venv
+source venv/bin/activate
+```
+
+**Install dependencies, configure env and run:**
+
+```bash
 pip install -r requirements.txt
-cp .env.example .env   # set DB_HOST=localhost
+cp .env.example .env        # then set DB_HOST=localhost in .env
+python manage.py makemigrations api
 python manage.py migrate
 python manage.py runserver
+```
+
+To deactivate the virtual environment when done:
+
+```bash
+deactivate
 ```
 
 ---
