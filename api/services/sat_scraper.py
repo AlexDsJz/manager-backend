@@ -1,7 +1,9 @@
 import io
 import csv
+import json
 import logging
 import time
+import unicodedata
 import zipfile
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urljoin
@@ -9,19 +11,17 @@ from urllib.parse import urljoin
 import chardet
 import requests
 from bs4 import BeautifulSoup
+from django.db import connection
 from django.utils import timezone
 
 from api.models.sat.import_batch import SATImportBatch
-from api.models.sat.canceled_taxpayer import CanceledTaxpayer
 
 logger = logging.getLogger(__name__)
 
 SAT_BASE_URL = "http://omawww.sat.gob.mx"
 SAT_PAGE_URL = (
-    "http://omawww.sat.gob.mx/cifras_sat/paginas/datos/vinculo.html"
-    "?page=ListCompleta69.html"
+    "http://omawww.sat.gob.mx/cifras_sat/Paginas/DatosAbiertos/contribuyentes_publicados.html"
 )
-BULK_BATCH_SIZE = 1000
 DOWNLOAD_TIMEOUT = 120
 
 REQUEST_HEADERS = {
@@ -50,23 +50,52 @@ COLUMN_MAP = {
 }
 
 
+_DOWNLOAD_EXTENSIONS = ('.zip', '.csv', '.txt')
+_CANCEL_KEYWORDS = ('cancelado', 'cancel', 'baja', 'lista69', 'lista_69', 'listcompleta69', 'l_69')
+
+
 def _find_download_url(page_url: str) -> str:
     response = requests.get(page_url, headers=REQUEST_HEADERS, timeout=30)
     response.raise_for_status()
 
     soup = BeautifulSoup(response.content, 'lxml')
+    all_links = [(tag.get_text(strip=True), tag['href']) for tag in soup.find_all('a', href=True)]
 
-    for tag in soup.find_all('a', href=True):
-        if 'cancelado' in tag.get_text(strip=True).lower():
-            href = tag['href']
-            return href if href.startswith('http') else urljoin(SAT_BASE_URL, href)
+    logger.debug("Links found on %s: %s", page_url, all_links)
 
-    for tag in soup.find_all('a', href=True):
-        href = tag['href'].lower()
-        if 'cancel' in href and any(href.endswith(ext) for ext in ('.zip', '.csv', '.txt')):
-            full = tag['href']
-            return full if full.startswith('http') else urljoin(SAT_BASE_URL, full)
+    def resolve(href: str) -> str:
+        return href if href.startswith('http') else urljoin(SAT_BASE_URL, href)
 
+    # Pass 1: link text mentions cancelado/cancela (original logic)
+    for text, href in all_links:
+        if 'cancelado' in text.lower() or 'cancela' in text.lower():
+            return resolve(href)
+
+    # Pass 2: href contains a cancel-related keyword AND has a download extension
+    for _, href in all_links:
+        href_lower = href.lower()
+        if any(kw in href_lower for kw in _CANCEL_KEYWORDS) and any(href_lower.endswith(ext) for ext in _DOWNLOAD_EXTENSIONS):
+            return resolve(href)
+
+    # Pass 3: any downloadable file whose href contains a cancel-related keyword (no extension filter)
+    for _, href in all_links:
+        href_lower = href.lower()
+        if any(kw in href_lower for kw in _CANCEL_KEYWORDS):
+            return resolve(href)
+
+    # Pass 4: any downloadable file on the same SAT domain (last resort)
+    for _, href in all_links:
+        href_lower = href.lower()
+        if any(href_lower.endswith(ext) for ext in _DOWNLOAD_EXTENSIONS):
+            full = resolve(href)
+            if 'sat.gob.mx' in full:
+                return full
+
+    logger.error(
+        "Could not find a download link on %s. All links found:\n%s",
+        page_url,
+        "\n".join(f"  [{text!r}] -> {href}" for text, href in all_links),
+    )
     raise ValueError(f"No download link for 'Cancelados' found on {page_url}")
 
 
@@ -104,6 +133,17 @@ def _safe_decimal(value: str):
         return None
 
 
+def _normalize_col(s: str) -> str:
+    """Lowercase + strip accents so 'Razón Social' matches 'razon social'."""
+    nfkd = unicodedata.normalize('NFKD', s)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+
+def _pg_escape(s: str) -> str:
+    """Escape a string value for PostgreSQL text COPY format."""
+    return s.replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
+
+
 def _bulk_insert(csv_bytes: bytes, batch: SATImportBatch) -> int:
     encoding = chardet.detect(csv_bytes[:10_000]).get('encoding') or 'utf-8'
     text = csv_bytes.decode(encoding, errors='replace')
@@ -114,43 +154,50 @@ def _bulk_insert(csv_bytes: bytes, batch: SATImportBatch) -> int:
         dialect = csv.excel
 
     reader = csv.DictReader(io.StringIO(text), dialect=dialect)
-    records = []
+
+    buf = io.StringIO()
     total = 0
 
     for row in reader:
-        if not any(v.strip() for v in row.values()):
+        if not any(v and v.strip() for v in row.values() if v is not None):
             continue
 
         mapped = {}
         extra = {}
         for col, val in row.items():
-            field = COLUMN_MAP.get(col.strip().lower())
+            if col is None:
+                continue
+            field = COLUMN_MAP.get(_normalize_col(col.strip()))
             if field:
-                mapped[field] = val.strip()
+                mapped[field] = (val or '').strip()
             else:
                 extra[col] = val
 
-        records.append(CanceledTaxpayer(
-            batch=batch,
-            rfc=mapped.get('rfc', ''),
-            name=mapped.get('name', ''),
-            person_type=mapped.get('person_type', ''),
-            assumption=mapped.get('assumption', ''),
-            credit_number=mapped.get('credit_number', ''),
-            amount=_safe_decimal(mapped.get('amount', '')),
-            state=mapped.get('state', ''),
-            extra_data=extra,
-        ))
+        amount = _safe_decimal(mapped.get('amount', ''))
 
-        if len(records) >= BULK_BATCH_SIZE:
-            CanceledTaxpayer.objects.bulk_create(records, ignore_conflicts=True)
-            total += len(records)
-            records = []
-            logger.debug("Inserted batch, total so far: %d", total)
+        buf.write('\t'.join([
+            _pg_escape(str(batch.pk)),
+            _pg_escape(mapped.get('rfc', '')),
+            _pg_escape(mapped.get('name', '')),
+            _pg_escape(mapped.get('person_type', '')),
+            _pg_escape(mapped.get('assumption', '')),
+            _pg_escape(mapped.get('credit_number', '')),
+            '\\N' if amount is None else str(amount),
+            _pg_escape(mapped.get('state', '')),
+            _pg_escape(json.dumps(extra, ensure_ascii=False)),
+        ]) + '\n')
+        total += 1
 
-    if records:
-        CanceledTaxpayer.objects.bulk_create(records, ignore_conflicts=True)
-        total += len(records)
+    logger.info("Parsed %d rows, starting COPY", total)
+    buf.seek(0)
+
+    with connection.cursor() as cursor:
+        cursor.copy_expert(
+            "COPY sat_canceled_taxpayers "
+            "(batch_id, rfc, name, person_type, assumption, credit_number, amount, state, extra_data) "
+            "FROM STDIN",
+            buf,
+        )
 
     return total
 

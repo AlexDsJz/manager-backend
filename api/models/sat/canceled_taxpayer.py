@@ -9,7 +9,7 @@ class CanceledTaxpayer(models.Model):
     )
     rfc = models.CharField(max_length=20, db_index=True)
     name = models.CharField(max_length=500)
-    person_type = models.CharField(max_length=50, blank=True, default='')
+    person_type = models.CharField(max_length=200, blank=True, default='')
     assumption = models.CharField(max_length=300, blank=True, default='')
     credit_number = models.CharField(max_length=100, blank=True, default='')
     amount = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
