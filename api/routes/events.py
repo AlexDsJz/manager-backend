@@ -1,4 +1,5 @@
 from rest_framework import viewsets, mixins, filters, status
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
 from rest_framework.routers import DefaultRouter
 from api.models.events.event import Event
@@ -14,6 +15,13 @@ class EventViewSet(viewsets.ModelViewSet):
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['name', 'event_code']
     ordering_fields = ['date', 'ticket_price', 'available_spots']
+
+    def get_permissions(self):
+        # Any authenticated user can list/retrieve events
+        if self.action in ('list', 'retrieve'):
+            return [IsAuthenticated()]
+        # Only admins can create, update or delete
+        return [IsAdminUser()]
 
     def destroy(self, request, *args, **kwargs):
         event = self.get_object()
@@ -34,6 +42,13 @@ class ReservationViewSet(
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['buyer_email', 'event__name', 'event__event_code']
     ordering_fields = ['created_at']
+
+    def get_permissions(self):
+        # Any authenticated user can create a reservation
+        if self.action == 'create':
+            return [IsAuthenticated()]
+        # Only admins can list or retrieve reservations
+        return [IsAdminUser()]
 
     def get_queryset(self):
         qs = Reservation.objects.select_related('event').order_by('-created_at')

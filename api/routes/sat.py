@@ -1,5 +1,6 @@
 from rest_framework import viewsets, mixins, filters, status
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
 from rest_framework.routers import DefaultRouter
 from api.models.sat.import_batch import SATImportBatch
@@ -15,6 +16,13 @@ class SATImportBatchViewSet(
 ):
     queryset = SATImportBatch.objects.all().order_by('-started_at')
     serializer_class = SATImportBatchSerializer
+
+    def get_permissions(self):
+        # Both roles can list/retrieve import history
+        if self.action in ('list', 'retrieve'):
+            return [IsAuthenticated()]
+        # Only admin can trigger a new import
+        return [IsAdminUser()]
 
     @action(detail=False, methods=['post'], url_path='trigger')
     def trigger(self, request):
